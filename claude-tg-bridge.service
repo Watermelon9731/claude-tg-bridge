@@ -1,0 +1,17 @@
+[Unit]
+Description=Telegram -> Claude Agent SDK -> VC bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# edit User and paths for your box
+User=you
+WorkingDirectory=/home/you/claude-tg-bridge
+EnvironmentFile=/home/you/claude-tg-bridge/.env
+ExecStart=/home/you/claude-tg-bridge/.venv/bin/python /home/you/claude-tg-bridge/tg_bridge.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
