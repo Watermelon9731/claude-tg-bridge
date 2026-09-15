@@ -51,6 +51,31 @@ SYSTEM_PROMPT = (
     "in your reply so this bridge can track it."
 )
 
+# /menu buttons -> a preset prompt for the agent. key -> (button label, prompt)
+QUICK_ACTIONS = {
+    "vc_agents": ("📋 Task/agent VC", "Liệt kê trạng thái các VC agent và task gần đây (vc.py agents). Tóm tắt ngắn."),
+    "latest_req": ("🆕 REQ mới nhất", "Tìm REQ mới nhất trong requests/ và tóm tắt trạng thái của nó."),
+    "backlog": ("📌 Backlog", "Đọc 05-log/BACKLOG.md, tóm tắt các mục đang mở."),
+    "status": ("📊 STATUS", "Đọc STATUS.md và tóm tắt tình hình hiện tại."),
+}
+
+# /<cmd> [text] -> run a repo skill. cmd -> (menu description, prompt template {rest})
+SKILL_CMDS = {
+    "po": ("Skill Product Owner", "Dùng skill ai-concierge-po. {rest}"),
+    "designer": ("Skill Designer", "Dùng skill ai-concierge-designer. {rest}"),
+}
+
+HELP = (
+    "Bridge Telegram → Claude → VC.\n\n"
+    "• Gõ tự do = nói với agent (đọc repo, chạy vc.py).\n"
+    "• /menu — nút tác vụ nhanh\n"
+    "• /status <id> — trạng thái VC task/REQ\n"
+    "• /po <việc> — chạy skill Product Owner\n"
+    "• /designer <việc> — chạy skill Designer\n"
+    "• /reset — xoá context\n\n"
+    "Lệnh ghi (vc.py send/task/upload, git push) sẽ hiện nút [✅ Duyệt] [❌ Từ chối]."
+)
+
 
 # --- Telegram (blocking urllib, run via asyncio.to_thread) -----------------
 def _tg_call(method: str, params: dict) -> dict:
@@ -61,14 +86,31 @@ def _tg_call(method: str, params: dict) -> dict:
         return json.load(r)
 
 
-async def tg_send(chat_id: int, text: str) -> None:
+async def tg_send(chat_id: int, text: str, reply_markup: dict | None = None) -> None:
     # Telegram caps a message at 4096 chars; chunk on line boundaries.
-    for chunk in _chunk(text, 4000):
+    # reply_markup (inline keyboard) rides on the last chunk only.
+    chunks = list(_chunk(text, 4000))
+    for i, chunk in enumerate(chunks):
+        params = {"chat_id": chat_id, "text": chunk}
+        if reply_markup and i == len(chunks) - 1:
+            params["reply_markup"] = json.dumps(reply_markup)
         try:
-            await asyncio.to_thread(_tg_call, "sendMessage",
-                                    {"chat_id": chat_id, "text": chunk})
+            await asyncio.to_thread(_tg_call, "sendMessage", params)
         except Exception as e:  # noqa: BLE001 - never let a send crash the loop
             print(f"[tg_send] {e}")
+
+
+async def tg_answer_callback(cb_id: str, text: str = "") -> None:
+    try:
+        await asyncio.to_thread(_tg_call, "answerCallbackQuery",
+                                {"callback_query_id": cb_id, "text": text})
+    except Exception as e:  # noqa: BLE001
+        print(f"[tg_answer] {e}")
+
+
+def kb(*rows) -> dict:
+    """Inline keyboard from rows of (label, callback_data) tuples."""
+    return {"inline_keyboard": [[{"text": t, "callback_data": d} for t, d in row] for row in rows]}
 
 
 def _chunk(text: str, size: int):
@@ -126,11 +168,12 @@ def _make_can_use_tool(chat_id: int):
             cmd = input_data.get("command", "")
             if not is_write_command(cmd):
                 return PermissionResultAllow(updated_input=input_data)
-            proposal = f"⚠️ Duyet lenh ghi?\n\n{cmd}\n\n/confirm hoac /deny"
+            proposal = f"⚠️ Duyệt lệnh ghi?\n\n{cmd}"
         else:
-            proposal = f"⚠️ Duyet {tool_name}?\n\n{json.dumps(input_data, ensure_ascii=False)[:1500]}\n\n/confirm hoac /deny"
+            proposal = f"⚠️ Duyệt {tool_name}?\n\n{json.dumps(input_data, ensure_ascii=False)[:1500]}"
 
-        await tg_send(chat_id, proposal)
+        await tg_send(chat_id, proposal + "\n\n(bấm nút hoặc /confirm · /deny)",
+                      reply_markup=kb([("✅ Duyệt", "confirm"), ("❌ Từ chối", "deny")]))
         fut = asyncio.get_running_loop().create_future()
         chats[chat_id].pending = fut
         try:
@@ -180,6 +223,19 @@ async def run_query(chat_id: int, text: str) -> None:
 
 
 # --- command dispatch ------------------------------------------------------
+def _resolve_pending(chat_id: int, approved: bool) -> bool:
+    chat = chats.get(chat_id)
+    if chat and chat.pending and not chat.pending.done():
+        chat.pending.set_result(approved)
+        return True
+    return False
+
+
+async def send_menu(chat_id: int) -> None:
+    rows = [[(label, f"q:{key}")] for key, (label, _) in QUICK_ACTIONS.items()]
+    await tg_send(chat_id, "Chọn tác vụ:", reply_markup=kb(*rows))
+
+
 async def handle_message(chat_id: int, text: str) -> None:
     if chat_id not in ALLOWLIST:
         return  # silently drop unknown chats
@@ -187,11 +243,8 @@ async def handle_message(chat_id: int, text: str) -> None:
 
     # /confirm and /deny must run even while a query holds the chat lock.
     if text in ("/confirm", "/deny"):
-        chat = chats.get(chat_id)
-        if chat and chat.pending and not chat.pending.done():
-            chat.pending.set_result(text == "/confirm")
-        else:
-            await tg_send(chat_id, "Khong co gi cho duyet.")
+        if not _resolve_pending(chat_id, text == "/confirm"):
+            await tg_send(chat_id, "Không có gì chờ duyệt.")
         return
 
     if text == "/reset":
@@ -201,18 +254,53 @@ async def handle_message(chat_id: int, text: str) -> None:
                 await chat.client.disconnect()
             except Exception:  # noqa: BLE001
                 pass
-        await tg_send(chat_id, "Da reset context.")
+        await tg_send(chat_id, "Đã reset context.")
+        return
+
+    if text in ("/menu", "/start"):
+        await send_menu(chat_id)
+        return
+
+    if text == "/help":
+        await tg_send(chat_id, HELP)
         return
 
     if text.startswith("/status"):
         arg = text[len("/status"):].strip()
-        q = (f"Kiem tra trang thai VC task/REQ {arg} va tra ve report neu co "
-             "(dung dung lenh vc.py theo CLAUDE.md)." if arg
-             else "Liet ke trang thai cac VC agent/task gan day (vc.py agents).")
+        q = (f"Kiểm tra trạng thái VC task/REQ {arg} và trả về report nếu có "
+             "(dùng đúng lệnh vc.py theo CLAUDE.md)." if arg
+             else "Liệt kê trạng thái các VC agent/task gần đây (vc.py agents).")
         await run_query(chat_id, q)
         return
 
+    # skill commands: /po <việc>, /designer <việc>
+    if text.startswith("/"):
+        head = text.split()[0][1:]
+        if head in SKILL_CMDS:
+            rest = text[len(text.split()[0]):].strip()
+            _, tmpl = SKILL_CMDS[head]
+            await run_query(chat_id, tmpl.format(rest=rest).strip())
+            return
+
     await run_query(chat_id, text)
+
+
+async def handle_callback(chat_id: int, cb_id: str, data: str) -> None:
+    if chat_id not in ALLOWLIST:
+        await tg_answer_callback(cb_id)
+        return
+    if data in ("confirm", "deny"):
+        ok = _resolve_pending(chat_id, data == "confirm")
+        await tg_answer_callback(
+            cb_id, ("Đã duyệt ✅" if data == "confirm" else "Đã từ chối ❌") if ok else "Không có gì chờ")
+        return
+    if data.startswith("q:"):
+        await tg_answer_callback(cb_id)
+        act = QUICK_ACTIONS.get(data[2:])
+        if act:
+            await run_query(chat_id, act[1])
+        return
+    await tg_answer_callback(cb_id)
 
 
 # --- VC async poller (push) ------------------------------------------------
@@ -254,16 +342,37 @@ async def poll_updates() -> None:
             continue
         for upd in resp.get("result", []):
             offset = upd["update_id"] + 1
+            if "callback_query" in upd:  # inline-button tap
+                cb = upd["callback_query"]
+                asyncio.create_task(handle_callback(
+                    cb["message"]["chat"]["id"], cb["id"], cb.get("data", "")))
+                continue
             msg = upd.get("message") or upd.get("edited_message")
             if not msg or "text" not in msg:
                 continue
             asyncio.create_task(handle_message(msg["chat"]["id"], msg["text"]))
 
 
+async def register_commands() -> None:
+    cmds = [
+        {"command": "menu", "description": "Nút tác vụ nhanh"},
+        {"command": "status", "description": "Trạng thái VC task/REQ <id>"},
+        {"command": "po", "description": "Skill Product Owner"},
+        {"command": "designer", "description": "Skill Designer"},
+        {"command": "reset", "description": "Xoá context"},
+        {"command": "help", "description": "Hướng dẫn"},
+    ]
+    try:
+        await asyncio.to_thread(_tg_call, "setMyCommands", {"commands": json.dumps(cmds)})
+    except Exception as e:  # noqa: BLE001
+        print(f"[setMyCommands] {e}")
+
+
 async def main() -> None:
     if not ALLOWLIST:
         raise SystemExit("TG_ALLOWLIST is empty — refusing to run open to everyone.")
     print(f"bridge up: repo={Path(REPO_DIR).resolve()} model={MODEL} allow={ALLOWLIST}")
+    await register_commands()
     await asyncio.gather(poll_updates(), poller())
 
 

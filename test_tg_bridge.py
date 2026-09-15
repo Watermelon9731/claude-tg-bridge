@@ -44,6 +44,20 @@ def test_allowlist_parsed():
     assert b.ALLOWLIST == {111, 222}
 
 
+def test_keyboard_shape():
+    k = b.kb([("A", "a"), ("B", "b")], [("C", "c")])
+    assert k == {"inline_keyboard": [
+        [{"text": "A", "callback_data": "a"}, {"text": "B", "callback_data": "b"}],
+        [{"text": "C", "callback_data": "c"}],
+    ]}
+
+
+def test_skill_cmd_template():
+    _, tmpl = b.SKILL_CMDS["po"]
+    assert tmpl.format(rest="làm REQ-1").strip() == "Dùng skill ai-concierge-po. làm REQ-1"
+    assert "ai-concierge-designer" in b.SKILL_CMDS["designer"][1]
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
