@@ -59,6 +59,13 @@ QUICK_ACTIONS = {
     "status": ("📊 STATUS", "Đọc STATUS.md và tóm tắt tình hình hiện tại."),
 }
 
+# friendly model names -> full id (anything else is passed through as-is)
+MODEL_PRESETS = {
+    "opus": "claude-opus-4-8",
+    "sonnet": "claude-sonnet-4-6",
+    "haiku": "claude-haiku-4-5",
+}
+
 # /<cmd> [text] -> run a repo skill. cmd -> (menu description, prompt template {rest})
 SKILL_CMDS = {
     "po": ("Skill Product Owner", "Dùng skill ai-concierge-po. {rest}"),
@@ -70,6 +77,7 @@ HELP = (
     "• Gõ tự do = nói với agent (đọc repo, chạy vc.py).\n"
     "• /menu — nút tác vụ nhanh\n"
     "• /status <id> — trạng thái VC task/REQ\n"
+    "• /model [opus|sonnet|haiku] — xem/đổi model\n"
     "• /po <việc> — chạy skill Product Owner\n"
     "• /designer <việc> — chạy skill Designer\n"
     "• /reset — xoá context\n\n"
@@ -158,6 +166,26 @@ class Chat:
 
 chats: dict[int, Chat] = {}
 watchers: dict[str, int] = {}  # vc task/req id -> chat_id
+current_model = MODEL          # switchable at runtime via /model
+
+
+def resolve_model(arg: str) -> str:
+    return MODEL_PRESETS.get(arg.lower().strip(), arg.strip())
+
+
+async def switch_model(new_model: str) -> None:
+    global current_model
+    current_model = new_model
+    for cid, chat in list(chats.items()):
+        try:
+            await chat.client.set_model(new_model)
+        except Exception as e:  # noqa: BLE001 - rebuild on next query if unsupported
+            print(f"[set_model] {e}; dropping session {cid} to rebuild")
+            try:
+                await chat.client.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+            chats.pop(cid, None)
 
 
 def _make_can_use_tool(chat_id: int):
@@ -192,8 +220,8 @@ async def get_chat(chat_id: int) -> Chat:
     if chat is None:
         client = ClaudeSDKClient(ClaudeAgentOptions(
             cwd=REPO_DIR,
-            model=MODEL,
             system_prompt=SYSTEM_PROMPT,
+            model=current_model,
             allowed_tools=["Read", "Grep", "Glob"],  # auto-approved
             permission_mode="default",
             can_use_tool=_make_can_use_tool(chat_id),
@@ -265,6 +293,18 @@ async def handle_message(chat_id: int, text: str) -> None:
         await tg_send(chat_id, HELP)
         return
 
+    if text.startswith("/model"):
+        arg = text[len("/model"):].strip()
+        if not arg:
+            await tg_send(chat_id, f"Model hiện tại: {current_model}",
+                          reply_markup=kb([("Opus", "m:opus"), ("Sonnet", "m:sonnet"),
+                                           ("Haiku", "m:haiku")]))
+        else:
+            m = resolve_model(arg)
+            await switch_model(m)
+            await tg_send(chat_id, f"Đã chuyển model: {m}")
+        return
+
     if text.startswith("/status"):
         arg = text[len("/status"):].strip()
         q = (f"Kiểm tra trạng thái VC task/REQ {arg} và trả về report nếu có "
@@ -299,6 +339,12 @@ async def handle_callback(chat_id: int, cb_id: str, data: str) -> None:
         act = QUICK_ACTIONS.get(data[2:])
         if act:
             await run_query(chat_id, act[1])
+        return
+    if data.startswith("m:"):
+        m = resolve_model(data[2:])
+        await switch_model(m)
+        await tg_answer_callback(cb_id, f"Model: {m}")
+        await tg_send(chat_id, f"Đã chuyển model: {m}")
         return
     await tg_answer_callback(cb_id)
 
@@ -357,6 +403,7 @@ async def register_commands() -> None:
     cmds = [
         {"command": "menu", "description": "Nút tác vụ nhanh"},
         {"command": "status", "description": "Trạng thái VC task/REQ <id>"},
+        {"command": "model", "description": "Xem / đổi model"},
         {"command": "po", "description": "Skill Product Owner"},
         {"command": "designer", "description": "Skill Designer"},
         {"command": "reset", "description": "Xoá context"},

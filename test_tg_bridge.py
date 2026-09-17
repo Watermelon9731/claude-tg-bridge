@@ -52,6 +52,13 @@ def test_keyboard_shape():
     ]}
 
 
+def test_resolve_model():
+    assert b.resolve_model("opus") == "claude-opus-4-8"
+    assert b.resolve_model("SONNET") == "claude-sonnet-4-6"
+    assert b.resolve_model("haiku") == "claude-haiku-4-5"
+    assert b.resolve_model("claude-opus-4-8") == "claude-opus-4-8"  # passthrough
+
+
 def test_skill_cmd_template():
     _, tmpl = b.SKILL_CMDS["po"]
     assert tmpl.format(rest="làm REQ-1").strip() == "Dùng skill ai-concierge-po. làm REQ-1"
